@@ -5,20 +5,21 @@ set -euo pipefail
 # Configuration
 # =========================
 
-# Set via environment or edit defaults below
+# NSX Manager connection
 NSX_MANAGER="${NSX_MANAGER:-nsx-mgr.lab.local}"
 NSX_USER="${NSX_USER:-admin}"
 NSX_PASS="${NSX_PASS:-VMware1!}"
 
-# Default site and enforcement point IDs (adjust if needed)
+# Site / Enforcement Point for edge-cluster listing
 SITE_ID="${SITE_ID:-default}"
 ENFORCEMENT_POINT_ID="${ENFORCEMENT_POINT_ID:-default}"
 
 BASE_URL="https://${NSX_MANAGER}"
 AUTH_CRED="${NSX_USER}:${NSX_PASS}"
 
-# Add -k to curl to ignore cert issues in lab environments
-CURL_COMMON=(-s -k -u "${AUTH_CRED}" -H "Content-Type: application/json")
+# Debug logging
+DEBUG="${NSX_DEBUG:-0}"
+LOG_FILE="./nsx_api_debug.log"
 
 # =========================
 # Helper functions
@@ -27,38 +28,114 @@ CURL_COMMON=(-s -k -u "${AUTH_CRED}" -H "Content-Type: application/json")
 usage() {
   cat <<EOF
 Usage:
-  $0 list
-      List Tier-1 gateways (ID, name, protection) and show Edge Cluster path on its own line.
+  $0 [--debug] <command> [args]
 
-  $0 list-edge-clusters
-      List available Edge Clusters for the configured site and enforcement point.
+Commands:
+  list
+      List Tier-1 gateways with protection, Edge Cluster association, and NAT status.
 
-  $0 change-edge-cluster <tier1-id> <edge-cluster-path> [<locale-service-id>]
-      Change the Edge Cluster for a Tier-1 gateway by updating its Locale Service.
+  list-edge-clusters
+      List Edge Clusters for the configured SITE_ID and ENFORCEMENT_POINT_ID.
 
-      Examples:
-        $0 change-edge-cluster t1-gw-01 \\
-           /infra/sites/${SITE_ID}/enforcement-points/${ENFORCEMENT_POINT_ID}/edge-clusters/edge-cluster-01
+  change-edge-cluster <tier1-id> <edge-cluster-path> [<locale-service-id>]
+      Change the Edge Cluster for a Tier-1 gateway (attach or move).
 
-        $0 change-edge-cluster t1-gw-01 \\
-           /infra/sites/${SITE_ID}/enforcement-points/${ENFORCEMENT_POINT_ID}/edge-clusters/edge-cluster-01 \\
-           ls-01
+  attach-edge-cluster <tier1-id> <edge-cluster-path> [<locale-service-id>]
+      Explicit alias for change-edge-cluster.
+
+  detach-edge-cluster <tier1-id> [<locale-service-id>]
+      Detach the Tier-1 gateway from its Edge Cluster by clearing edge_cluster_path
+      on the Locale Service.
 
 Environment variables:
-  NSX_MANAGER             NSX Manager hostname or IP (default: nsx-mgr.lab.local)
-  NSX_USER                NSX username (default: admin)
-  NSX_PASS                NSX password (default: VMware1!)
-  SITE_ID                 Site ID for Policy (default: default)
-  ENFORCEMENT_POINT_ID    Enforcement Point ID (default: default)
+  NSX_MANAGER            NSX Manager hostname or IP (default: nsx-mgr.lab.local)
+  NSX_USER               NSX username              (default: admin)
+  NSX_PASS               NSX password              (default: VMware1!)
+  SITE_ID                Site ID for edge clusters (default: default)
+  ENFORCEMENT_POINT_ID   Enforcement point ID      (default: default)
+  NSX_DEBUG              Set to 1 to enable debug logging to ${LOG_FILE}
+
+Examples:
+  $0 list
+  $0 list-edge-clusters
+  $0 change-edge-cluster t1-gw-01 /infra/sites/default/enforcement-points/default/edge-clusters/edge-cluster-01
+  $0 detach-edge-cluster t1-gw-01
 EOF
 }
 
-# Get protection flag for a Policy object (Tier-1 or Locale Service)
+# Single wrapper for all NSX API calls.
+# - Adds auth, JSON headers
+# - Adds X-Allow-Overwrite: true on all modifying methods (POST/PUT/PATCH/DELETE)
+# - When DEBUG=1, logs method, URL, body and response to LOG_FILE
+nsx_curl() {
+  local method="$1"
+  local url="$2"
+  local data="${3:-}"
+
+  local curl_args=(-s -k -u "${AUTH_CRED}" -H "Content-Type: application/json" -X "${method}")
+
+  case "${method}" in
+    POST|PUT|PATCH|DELETE)
+      curl_args+=(-H "X-Allow-Overwrite: true")
+      ;;
+  esac
+
+  if [[ -n "${data}" ]]; then
+    curl_args+=(-d "${data}")
+  fi
+
+  if [[ "${DEBUG}" == "1" ]]; then
+    {
+      echo "==== $(date '+%Y-%m-%d %H:%M:%S') ===="
+      echo "METHOD: ${method}"
+      echo "URL   : ${url}"
+      if [[ -n "${data}" ]]; then
+        echo "BODY  : ${data}"
+      fi
+      echo "----- RESPONSE -----"
+    } >> "${LOG_FILE}"
+    # Log and also output to stdout for the caller
+    curl "${curl_args[@]}" "${url}" 2>>"${LOG_FILE}" | tee -a "${LOG_FILE}"
+  else
+    curl "${curl_args[@]}" "${url}"
+  fi
+}
+
 get_protection() {
   local url="$1"
+  nsx_curl "GET" "${url}" | jq -r '._protection // "UNKNOWN"'
+}
 
-  curl "${CURL_COMMON[@]}" -X GET "${url}" \
-    | jq -r '._protection // "UNKNOWN"'
+# Return "PRESENT", "NONE", or "UNKNOWN"
+check_nat_rules() {
+  local t1_id="$1"
+  local nat_base_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/nat"
+
+  local nat_json
+  nat_json="$(nsx_curl "GET" "${nat_base_url}")" || { echo "UNKNOWN"; return 0; }
+
+  local nat_count
+  nat_count="$(echo "${nat_json}" | jq '.results | length' 2>/dev/null || echo "0")"
+
+  if [[ "${nat_count}" -eq 0 ]]; then
+    echo "NONE"
+    return 0
+  fi
+
+  # Iterate over NAT services and see if any has NAT rules
+  while read -r nat_id; do
+    local rules_url="${nat_base_url}/${nat_id}/nat-rules"
+    local rules_json
+    rules_json="$(nsx_curl "GET" "${rules_url}")" || continue
+    local rule_count
+    rule_count="$(echo "${rules_json}" | jq '.results | length' 2>/dev/null || echo "0")"
+    if [[ "${rule_count}" -gt 0 ]]; then
+      echo "PRESENT"
+      return 0
+    fi
+  done < <(echo "${nat_json}" | jq -r '.results[].id')
+
+  echo "NONE"
 }
 
 # =========================
@@ -67,146 +144,154 @@ get_protection() {
 
 list_tier1_gateways() {
   local t1_url="${BASE_URL}/policy/api/v1/infra/tier-1s"
-
-  # Get all Tier-1s
   local t1_json
-  t1_json="$(curl "${CURL_COMMON[@]}" -X GET "${t1_url}")"
+  t1_json="$(nsx_curl "GET" "${t1_url}")"
 
-  echo "Tier-1 Gateways and their Edge Cluster associations"
-  echo "=================================================="
-  echo
+  echo "Listing Tier-1 gateways, Edge Cluster associations, and NAT status"
+  echo "=================================================================="
 
-  # Loop over tier-1s
   echo "${t1_json}" | jq -r '.results[] | @base64' | while read -r t1_b64; do
     _t1() { echo "${t1_b64}" | base64 --decode | jq -r "$1"; }
 
     local t1_id t1_name t1_protection
-    t1_id=$(_t1 '.id')
-    t1_name=$(_t1 '.display_name')
-    t1_protection=$(_t1 '._protection // "UNKNOWN"')
+    t1_id="$(_t1 '.id')"
+    t1_name="$(_t1 '.display_name')"
+    t1_protection="$(_t1 '._protection // "UNKNOWN"')"
 
-    # For each Tier-1, get its locale-services and edge_cluster_path (take first locale service)
+    echo "TIER1_ID      : ${t1_id}"
+    echo "DISPLAY_NAME  : ${t1_name}"
+    echo "PROTECTION    : ${t1_protection}"
+
+    # Edge Cluster info via Locale Services
     local ls_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/locale-services"
-    local ls_json edge_cluster_path
+    local ls_json
+    ls_json="$(nsx_curl "GET" "${ls_url}")"
 
-    ls_json="$(curl "${CURL_COMMON[@]}" -X GET "${ls_url}")"
+    local ls_count
+    ls_count="$(echo "${ls_json}" | jq '.results | length' 2>/dev/null || echo "0")"
 
-    edge_cluster_path="$(
-      echo "${ls_json}" \
-        | jq -r '.results[0].edge_cluster_path // "NONE"'
-    )"
+    if [[ "${ls_count}" -eq 0 ]]; then
+      echo "EDGE_CLUSTER  : NONE (no locale services)"
+    else
+      echo "${ls_json}" | jq -r '.results[] | "EDGE_CLUSTER  : \(.edge_cluster_path // "NONE") (ls-id=\(.id))"'
+    fi
 
-    printf "TIER1_ID     : %s\n" "${t1_id}"
-    printf "DISPLAY_NAME : %s\n" "${t1_name}"
-    printf "PROTECTION   : %s\n" "${t1_protection}"
-    printf "EDGE_CLUSTER : %s\n" "${edge_cluster_path}"
-    echo "--------------------------------------------------"
+    # NAT status
+    local nat_status
+    nat_status="$(check_nat_rules "${t1_id}")"
+    echo "NAT_RULES     : ${nat_status}"
+
+    echo "------------------------------------------------------------"
   done
 }
 
 list_edge_clusters() {
   local ec_url="${BASE_URL}/policy/api/v1/infra/sites/${SITE_ID}/enforcement-points/${ENFORCEMENT_POINT_ID}/edge-clusters"
-
   local ec_json
-  ec_json="$(curl "${CURL_COMMON[@]}" -X GET "${ec_url}")"
+  ec_json="$(nsx_curl "GET" "${ec_url}")"
 
-  echo "Edge Clusters (site=${SITE_ID}, enforcement-point=${ENFORCEMENT_POINT_ID})"
-  echo "====================================================================="
-  echo
+  echo "Listing Edge Clusters (site=${SITE_ID}, enforcement-point=${ENFORCEMENT_POINT_ID})"
+  echo "==============================================================================="
 
-  echo "${ec_json}" | jq -r '.results[] | @base64' | while read -r ec_b64; do
-    _ec() { echo "${ec_b64}" | base64 --decode | jq -r "$1"; }
-
-    local ec_id ec_name ec_path member_count
-    ec_id=$(_ec '.id')
-    ec_name=$(_ec '.display_name')
-    ec_path=$(_ec '.path')
-    member_count=$(_ec '.members | length // 0')
-
-    printf "EDGE_CLUSTER_ID   : %s\n" "${ec_id}"
-    printf "DISPLAY_NAME      : %s\n" "${ec_name}"
-    printf "PATH              : %s\n" "${ec_path}"
-    printf "MEMBER_COUNT      : %s\n" "${member_count}"
-    echo "--------------------------------------------------"
-  done
+  echo "${ec_json}" | jq -r '.results[] | "ID           : \(.id)\nDISPLAY_NAME : \(.display_name)\nPATH         : \(.path)\nMEMBERS      : \(.members | length)\n------------------------------------------------------------"'
 }
 
+# Change (attach/move) Edge Cluster for a Tier-1
 change_t1_edge_cluster() {
   local t1_id="$1"
   local edge_cluster_path="$2"
   local locale_service_id="${3:-}"
 
-  # -------------------------
-  # 1. Determine Locale Service ID
-  # -------------------------
+  echo "Changing Edge Cluster:"
+  echo "  Tier-1 ID        : ${t1_id}"
+  echo "  Edge Cluster Path: ${edge_cluster_path}"
+
+  # Discover Locale Service if not provided
   if [[ -z "${locale_service_id}" ]]; then
     echo "Discovering Locale Service for Tier-1 '${t1_id}'..."
     local ls_list_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/locale-services"
+    local ls_list_json
+    ls_list_json="$(nsx_curl "GET" "${ls_list_url}")"
 
-    locale_service_id=$(
-      curl "${CURL_COMMON[@]}" -X GET "${ls_list_url}" \
-        | jq -r '.results[0].id'
-    )
-
-    if [[ "${locale_service_id}" == "null" || -z "${locale_service_id}" ]]; then
+    locale_service_id="$(echo "${ls_list_json}" | jq -r '.results[0].id')"
+    if [[ -z "${locale_service_id}" || "${locale_service_id}" == "null" ]]; then
       echo "ERROR: No Locale Services found for Tier-1 '${t1_id}'."
       exit 1
     fi
-
     echo "Using Locale Service: ${locale_service_id}"
   fi
 
-  local t1_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}"
   local ls_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/locale-services/${locale_service_id}"
+  local t1_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}"
 
-  # -------------------------
-  # 2. Determine protection status
-  # -------------------------
-  echo "Checking protection flags..."
+  echo "Fetching existing Locale Service JSON..."
+  local ls_json
+  ls_json="$(nsx_curl "GET" "${ls_url}")"
 
-  local t1_protection
+  local t1_protection ls_protection
   t1_protection="$(get_protection "${t1_url}")"
-
-  local ls_protection
-  ls_protection="$(get_protection "${ls_url}")"
+  ls_protection="$(echo "${ls_json}" | jq -r '._protection // "UNKNOWN"')"
 
   echo "Tier-1 _protection       : ${t1_protection}"
   echo "LocaleService _protection: ${ls_protection}"
 
-  # Decide whether to send X-Allow-Overwrite: true
-  declare -a overwrite_header=()
-  if [[ "${t1_protection}" == "PROTECTED" || "${t1_protection}" == "REQUIRE_OVERRIDE" \
-     || "${ls_protection}" == "PROTECTED" || "${ls_protection}" == "REQUIRE_OVERRIDE" ]]; then
-    echo "Object is protected or requires override; enabling X-Allow-Overwrite: true..."
-    overwrite_header=(-H "X-Allow-Overwrite: true")
-  fi
+  # Build full updated Locale Service payload (preserve revision and other fields)
+  local updated_ls
+  updated_ls="$(echo "${ls_json}" | jq --arg ec "${edge_cluster_path}" 'del(._links) | .edge_cluster_path = $ec')"
 
-  # -------------------------
-  # 3. Build minimal Locale Service payload
-  # -------------------------
-  local payload
-  payload="$(jq -n \
-    --arg id "${locale_service_id}" \
-    --arg ec_path "${edge_cluster_path}" '
-      {
-        "id": $id,
-        "display_name": $id,
-        "edge_cluster_path": $ec_path
-      }
-    ')"
-
-  echo "Updating Locale Service '${locale_service_id}' with edge_cluster_path:"
-  echo "  ${edge_cluster_path}"
-
-  # -------------------------
-  # 4. PATCH Locale Service
-  # -------------------------
-  curl "${CURL_COMMON[@]}" "${overwrite_header[@]}" \
-    -X PATCH "${ls_url}" \
-    -d "${payload}" | jq '.'
+  echo "Attaching Edge Cluster on Locale Service '${locale_service_id}'..."
+  nsx_curl "PUT" "${ls_url}" "${updated_ls}" >/dev/null
 
   echo "Done. Verify with:"
-  echo "  curl -k -u ${AUTH_CRED} -X GET \"${ls_url}\" | jq '.edge_cluster_path, ._protection'"
+  echo "  ${0} list"
+}
+
+# Detach Edge Cluster for a Tier-1
+detach_t1_edge_cluster() {
+  local t1_id="$1"
+  local locale_service_id="${2:-}"
+
+  echo "Detaching Edge Cluster:"
+  echo "  Tier-1 ID : ${t1_id}"
+
+  # Discover Locale Service if not provided
+  if [[ -z "${locale_service_id}" ]]; then
+    echo "Discovering Locale Service for Tier-1 '${t1_id}'..."
+    local ls_list_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/locale-services"
+    local ls_list_json
+    ls_list_json="$(nsx_curl "GET" "${ls_list_url}")"
+
+    locale_service_id="$(echo "${ls_list_json}" | jq -r '.results[0].id')"
+    if [[ -z "${locale_service_id}" || "${locale_service_id}" == "null" ]]; then
+      echo "No Locale Services found for Tier-1 '${t1_id}'. Nothing to detach."
+      return 0
+    fi
+    echo "Using Locale Service: ${locale_service_id}"
+  fi
+
+  local ls_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}/locale-services/${locale_service_id}"
+  local t1_url="${BASE_URL}/policy/api/v1/infra/tier-1s/${t1_id}"
+
+  echo "Fetching existing Locale Service JSON..."
+  local ls_json
+  ls_json="$(nsx_curl "GET" "${ls_url}")"
+
+  local t1_protection ls_protection
+  t1_protection="$(get_protection "${t1_url}")"
+  ls_protection="$(echo "${ls_json}" | jq -r '._protection // "UNKNOWN"')"
+
+  echo "Tier-1 _protection       : ${t1_protection}"
+  echo "LocaleService _protection: ${ls_protection}"
+
+  # Build payload with edge_cluster_path cleared
+  local updated_ls
+  updated_ls="$(echo "${ls_json}" | jq 'del(._links) | .edge_cluster_path = null')"
+
+  echo "Detaching Edge Cluster from Locale Service '${locale_service_id}'..."
+  nsx_curl "PUT" "${ls_url}" "${updated_ls}" >/dev/null
+
+  echo "Done. Verify with:"
+  echo "  ${0} list"
 }
 
 # =========================
@@ -214,10 +299,23 @@ change_t1_edge_cluster() {
 # =========================
 
 main() {
+  # Handle optional --debug flag
+  if [[ "${1:-}" == "--debug" ]]; then
+    DEBUG=1
+    # Truncate existing log
+    : > "${LOG_FILE}"
+    shift
+  fi
+
   local cmd="${1:-}"
 
+  if [[ -z "${cmd}" ]]; then
+    usage
+    exit 1
+  fi
+
   case "${cmd}" in
-    list|list-t1)
+    list)
       list_tier1_gateways
       ;;
     list-edge-clusters)
@@ -230,6 +328,22 @@ main() {
         exit 1
       fi
       change_t1_edge_cluster "$2" "$3" "${4:-}"
+      ;;
+    attach-edge-cluster)
+      if [[ $# -lt 3 ]]; then
+        echo "ERROR: Missing arguments."
+        usage
+        exit 1
+      fi
+      change_t1_edge_cluster "$2" "$3" "${4:-}"
+      ;;
+    detach-edge-cluster)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: Missing arguments."
+        usage
+        exit 1
+      fi
+      detach_t1_edge_cluster "$2" "${3:-}"
       ;;
     *)
       usage
