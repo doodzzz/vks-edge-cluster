@@ -10,6 +10,7 @@ A Bash-based automation utility for VMware NSX (validated on **NSX
     updating its Locale Service.
 -   Automatically apply `X-Allow-Overwrite: true` when working with
     protected Policy objects.
+-   De-attach and attach Tier-1 gateways from Edge Clusters. 
 
 This tool is designed for NSX environments where managing multiple
 Tier-1 gateways and Edge Cluster migrations is a common operational
